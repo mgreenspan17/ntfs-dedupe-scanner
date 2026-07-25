@@ -47,13 +47,18 @@
 .NOTES
     Script     : Invoke-NTFSDedupeScan.ps1
     Program    : ntfs-dedupe-scanner
-    Version    : 0.1.0
+    Version    : 0.2.0
     Author     : Mannie Greenspan <Oz agent>
     Harness    : agent:oz|mannie-greenspan
     License    : MIT
     Generated  : 2026-07-25
     See also   : ../docs/OUTPUT_SCHEMA.md, ../docs/ARCHITECTURE.md
 
+    v0.2.0  2026-07-25  Pre-scan counter + live Write-Progress bar;
+                       new C# helpers ScanSingleFile / CountFiles /
+                       EnumerateFiles; per-file hashing loop replaces
+                       the bulk Parallel.ForEach call (stays compatible
+                       with Windows PowerShell 5.1).
     v0.1.0  2026-07-25  Initial scaffold.
 #>
 
@@ -339,6 +344,53 @@ public static class NTFSHashScanner {
 
         return bag.ToList();
     }
+
+    /// <summary>
+    /// Lazy enumeration of every regular file under <paramref name="rootPath"/>,
+    /// honouring <paramref name="skipNames"/> (case-insensitive leaf match).
+    /// Exposed so PowerShell can drive per-file work with a progress bar.
+    /// </summary>
+    public static IEnumerable<string> EnumerateFiles(string rootPath, string[] skipNames) {
+        if (string.IsNullOrEmpty(rootPath)) throw new ArgumentNullException("rootPath");
+        var skip = new HashSet<string>(
+            skipNames ?? new string[0],
+            StringComparer.OrdinalIgnoreCase);
+        return Enumerate(rootPath, skip);
+    }
+
+    /// <summary>
+    /// Fast directory walk that returns just the candidate-file count.
+    /// Used to seed the live progress bar without buffering paths.
+    /// </summary>
+    public static int CountFiles(string rootPath, string[] skipNames) {
+        int n = 0;
+        foreach (var _ in EnumerateFiles(rootPath, skipNames)) { n++; }
+        return n;
+    }
+
+    /// <summary>
+    /// Hash + inode lookup for a single file. Returns a populated
+    /// <see cref="ScanRecord"/> or <c>null</c> on any per-file failure.
+    /// Designed to be called once per file from a PowerShell loop so
+    /// the caller can drive <c>Write-Progress</c> between calls.
+    /// </summary>
+    public static ScanRecord ScanSingleFile(string file, string blake3Exe) {
+        if (string.IsNullOrEmpty(file)) return null;
+        try {
+            var fi = new FileInfo(file);
+            return new ScanRecord {
+                Path  = file,
+                Size  = fi.Length,
+                Hash  = string.IsNullOrEmpty(blake3Exe)
+                            ? Sha256Hex(file)
+                            : Blake3Hex(file, blake3Exe),
+                Inode = GetFileId(file)
+            };
+        } catch {
+            /* permission denied, vanished file, locked handle, etc. */
+            return null;
+        }
+    }
 }
 '@
 
@@ -354,42 +406,23 @@ $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $blake3ForCS = if ($HashAlgorithm -eq 'BLAKE3') { $Script:B3SumPath } else { $null }
 $skipForCS   = if ($IncludeSystemPaths)        { @() }              else { $Script:DefaultSkip }
 
-Write-Host ("[{0:HH:mm:ss}] enumerating + hashing (please wait) ..." -f (Get-Date)) -ForegroundColor Yellow
+# 6a. Pre-scan: fast directory walk that just counts candidate files.
+Write-Host ("[{0:HH:mm:ss}] pre-scanning candidate files ..." -f (Get-Date)) -ForegroundColor Yellow
+$total = [NTFSHashScanner]::CountFiles($Path, $skipForCS)
 
-$records = [NTFSHashScanner]::Scan(
-    $Path,
-    $ThrottleLimit,
-    $skipForCS,
-    $blake3ForCS,
-    [bool]$DryRun
-)
-
-$stopwatch.Stop()
-$elapsed = $stopwatch.Elapsed
-
+# 6b. DryRun short-circuit: pre-scan count is the entire result.
 if ($DryRun) {
-    $countOnly = 0
-    foreach ($_ in [NTFSHashScanner]::Scan($Path, 1, $skipForCS, $null, $false)) { $countOnly++ }  # recycle; we'll redry
-    # Simpler: rerun enumeration via PS
-    $countOnly = 0
-    $stack = New-Object System.Collections.Generic.Stack[string]
-    $stack.Push((Resolve-Path -LiteralPath $Path).ProviderPath)
-    $seen = @{}
-    while ($stack.Count -gt 0) {
-        $d = $stack.Pop()
-        if ($seen[$d]) { continue }; $seen[$d] = $true
-        $leaf = Split-Path -Leaf $d
-        if ($leaf -and -not $IncludeSystemPaths -and $Script:DefaultSkip -contains $leaf) { continue }
-        try { foreach ($f in [IO.Directory]::EnumerateFiles($d)) { $countOnly++ } } catch { }
-        try { foreach ($sd in [IO.Directory]::EnumerateDirectories($d)) { $stack.Push($sd) } } catch { }
-    }
+    $stopwatch.Stop()
+    $elapsed = $stopwatch.Elapsed
     Write-Host ''
-    Write-Host ("DryRun complete: {0:N0} candidate files in {1:F1}s" -f $countOnly, $elapsed.TotalSeconds) -ForegroundColor Green
+    Write-Host ("DryRun complete: {0:N0} candidate files in {1:F1}s" -f $total, $elapsed.TotalSeconds) -ForegroundColor Green
+    $dryStatus = '{0:N0} candidate files' -f $total
+    Write-Progress -Activity 'NTFS deduplication scan (dry-run)' -Status $dryStatus -PercentComplete 100 -Completed
     return [pscustomobject]@{
         sessionId        = $Script:SessionId
         sessionName      = $Script:SessionName
         signature        = $Script:Signature
-        scannedFiles     = $countOnly
+        scannedFiles     = $total
         duplicateGroups  = 0
         totalWastedBytes = 0
         jsonPath         = $null
@@ -399,7 +432,34 @@ if ($DryRun) {
     }
 }
 
-Write-Host ("[{0:HH:mm:ss}] {1:N0} scan records ready ({2:F1}s)" -f (Get-Date), $records.Count, $elapsed.TotalSeconds) -ForegroundColor Yellow
+# 6c. Per-file hashing loop with live Write-Progress.
+$records    = New-Object 'System.Collections.Generic.List[object]'
+$done       = 0
+$progressActivity = "NTFS deduplication scan"
+$pollEvery  = if ($total -gt 0) { [Math]::Max(1, [int]($total / 100)) } else { 1 }
+
+Write-Host ("[{0:HH:mm:ss}] hashing {1:N0} files (1-by-1, --ThrottleLimit {2} reserved for future use) ..." -f (Get-Date), $total, $ThrottleLimit) -ForegroundColor Yellow
+
+try {
+    foreach ($file in [NTFSHashScanner]::EnumerateFiles($Path, $skipForCS)) {
+        $rec = [NTFSHashScanner]::ScanSingleFile($file, $blake3ForCS)
+        if ($rec) { $records.Add($rec) }
+        $done++
+        if ($done -eq 1 -or $done -eq $total -or (($done % 25) -eq 0) -or (($done % $pollEvery) -eq 0)) {
+            $pct = if ($total -gt 0) { [int]([math]::Round(($done / [double]$total) * 100, 0)) } else { 100 }
+            if ($pct -gt 100) { $pct = 100 }
+            $status = "{0:N0} / {1:N0} files ({2}%)" -f $done, $total, $pct
+            Write-Progress -Activity $progressActivity -Status $status -PercentComplete $pct -CurrentOperation $file
+        }
+    }
+} finally {
+    Write-Progress -Activity $progressActivity -Completed
+}
+
+$stopwatch.Stop()
+$elapsed = $stopwatch.Elapsed
+
+Write-Host ("[{0:HH:mm:ss}] {1:N0}/{2:N0} files hashed, {3:N0} scan records ready ({4:F1}s)" -f (Get-Date), $done, $total, $records.Count, $elapsed.TotalSeconds) -ForegroundColor Yellow
 
 # ---------------------------------------------------------------------------
 # 7. Group by hash, classify duplicates, compute wasted bytes
