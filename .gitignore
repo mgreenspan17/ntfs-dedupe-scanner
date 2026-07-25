@@ -1,0 +1,23 @@
+# OS / editor noise
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# PowerShell local artifacts
+*.ps1.xml
+
+# Generated reports
+output/*
+!output/.gitkeep
+sample-data/*
+!sample-data/.gitkeep
+
+# Logs and caches
+*.log
+*.cache
+*.tmp
+
+# VS Code / JetBrains
+.vscode/
+.idea/
+*.swp
