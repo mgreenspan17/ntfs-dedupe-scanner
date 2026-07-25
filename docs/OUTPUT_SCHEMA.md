@@ -11,11 +11,16 @@ Every run produces:
 `sessionId` is a fresh UUID per run.
 `timestamp` is `yyyyMMddTHHmmss` of the run start.
 
-## JSON v1.0.0 (current)
+## JSON v1.0.1 (current)
+
+The `schemaVersion` rolled additive from `1.0.0 -> 1.0.1` in v0.4.0 to
+surface BLAKE3 -> SHA256 per-file fallback decisions to dashboards.
+Older consumers that ignore unknown fields continue to parse v1.0.1
+output unchanged; see the *Migration* section below.
 
 ```json
 {
-  "schemaVersion": "1.0.0",
+  "schemaVersion": "1.0.1",
   "session": {
     "id":   "019f99b3-6809-7dd8-b347-9ae1ae9e3fbc",
     "name": "dedupe-43182",
@@ -27,7 +32,9 @@ Every run produces:
   "completedAt": "2026-07-25T14:39:12Z",
   "durationSeconds": 254,
   "path": "C:\\",
-  "hashAlgorithm": "SHA256",
+  "hashAlgorithm": "BLAKE3",
+  "hashAlgorithmFallback": null,
+  "blake3FallbackCount": 0,
   "includeSystemPaths": false,
   "throttleLimit": 8,
   "skippedFolders": [ "$Recycle.Bin", "System Volume Information", ... ],
@@ -66,19 +73,44 @@ Every run produces:
 }
 ```
 
-## v0.3.0 additions
+## v0.4.0 additions (schemaVersion 1.0.1)
 
-The schemaVersion stayed at `1.0.0`. v0.3.0 added three purely additive
-fields:
+BLAKE3 is now the primary hash algorithm with explicit, visible
+SHA256 fallback. The `schemaVersion` rolled from `1.0.0` to `1.0.1`
+to expose two new top-level fallback indicators:
+
+- `hashAlgorithmFallback` — `string` or `null`. `null` when every
+  scanned file was hashed with the requested algorithm (the happy
+  path, no fallback). Set to `"SHA256"` whenever at least one file
+  was re-hashed with SHA256 because the per-file BLAKE3 invocation
+  failed (non-zero exit, 30 s timeout, non-empty stderr, or empty
+  token). Useful for dashboards that want to flag runs where the
+  primary algorthm was not 100 % successful.
+- `blake3FallbackCount` — `int`. Total number of files that fell back
+  to SHA256 during the run. Always 0 when `hashAlgorithm` is `"SHA256"`
+  (the run never tried BLAKE3) and always 0 when every BLAKE3 call
+  succeeded.
+
+These top-level fields are additive; the per-group / per-file shape
+under `groups[].files[]` is unchanged (still `path`, `inode`, `size`,
+`hardlinked`, `wastedBytes`). Existing dashboards continue to parse
+`schema=1.0.x` files unchanged.
+
+## v0.3.0 additions (schemaVersion 1.0.0)
+
+v0.3.0 added three purely additive fields (no version roll, since
+the additions are non-breaking):
 
 - `totalBytes` — sum of bytes across all enumerated files
 - `speedMBps` — instantaneous, 5-s moving average, peak MB/s during the run
 - `perFolder` — array of one entry per folder (DFS order) with files / bytes
   / wall-clock duration / files-per-second
 
-Older consumers ignore these. The `schemaVersion` does **not** roll for
-additive field changes; it rolls only for breaking changes. See
-`../CHANGELOG.md` for the full changelog and
+Older consumers ignore these. The `schemaVersion` does **not** roll
+automatically for additive field changes; it rolled in v0.4.0 only
+because the new top-level fields (`hashAlgorithmFallback`,
+`blake3FallbackCount`) are observability signals dashboards may want
+to assert on. See `../CHANGELOG.md` for the full changelog and
 `../docs/LOGGING.md` for the structured-log vocabulary that mirrors
 these counters.
 
@@ -94,7 +126,9 @@ these counters.
 | `scannedAt` / `completedAt` | ISO-8601 | UTC start / end timestamps                       |
 | `durationSeconds`           | int      | Wall-clock elapsed                               |
 | `path`                      | string   | Root that was scanned                            |
-| `hashAlgorithm`             | string   | `SHA256` or `BLAKE3`                             |
+| `hashAlgorithm`             | string   | `SHA256` or `BLAKE3` (the requested primary)     |
+| `hashAlgorithmFallback`     | string?  | `null` when no fallback; `"SHA256"` when >=1 file was re-hashed (v0.4.0) |
+| `blake3FallbackCount`       | int      | Number of files that fell back from BLAKE3 -> SHA256 (v0.4.0) |
 | `includeSystemPaths`        | bool     | Whether the skip-list was bypassed               |
 | `throttleLimit`             | int      | Worker count reserved (sequential in 0.3.0)     |
 | `skippedFolders`            | string[] | Resolved leaf names that were skipped            |
@@ -137,9 +171,36 @@ into Excel / DuckDB / pandas.
 - **Patch** — extra optional fields, no field rename or removal
   (v0.3.0 is of this kind: `totalBytes`, `speedMBps`, `perFolder`
   are all additive).
-- **Minor** — additive semantic change (new group, new top-level array).
+- **Minor** — additive top-level observability signal that dashboards
+  may want to assert on (v0.4.0 is of this kind: `hashAlgorithmFallback`
+  and `blake3FallbackCount` are added and `schemaVersion` rolled to
+  `1.0.1` so consumers can branch on it).
 - **Major** — renaming, removal, or semantically-different field
   (e.g. `WastedBytes` semantics change).
 
 Dashboards should ignore fields they do not understand and rely only
 on the fields they care about.
+
+## Migration: v1.0.0 -> v1.0.1
+
+Existing dashboards that only read the original v1.0.0 fields
+(`schemaVersion`, `session.*`, `path`, `hashAlgorithm`, `scannedFiles`,
+`duplicateGroups`, `groups[]`, etc.) continue to work without any
+change — `schemaVersion=1.0.1` is purely additive on top of `1.0.0`.
+Dashboards that want to surface fallbacks should:
+
+1. Treat `hashAlgorithmFallback !== null` as a warning state on the
+   run (style it yellow in the UI, e.g.). A `null` is the happy path.
+2. Show `blake3FallbackCount` as a counter next to `scannedFiles`
+   — if non-zero, some files were silently re-hashed under SHA256
+   and downstream duplicate detection for that run is now a
+   mixed-algorithm pool (BLAKE3 vs SHA256 hashes are not directly
+   comparable across files).
+3. If a dashboard wants to keep BLAKE3 / SHA256 duplicate groups
+   separated for cross-run comparability, branch on
+   `hashAlgorithmFallback === null` before displaying
+   `duplicateGroups`.
+
+CSV columns are unchanged; the `UsedFallback` decision is reported
+only via the JSON top-level fields and the structured log file
+(`./logs/ntfs-dedupe-scan-*.log`).
