@@ -46,3 +46,10 @@ Yes. The C# scan loop catches all per-file exceptions, drops the
 record silently, and continues. Cancel via `Ctrl+C` and partial
 JSON/CSV may remain on disk from the previous complete run; they are
 not overwritten unless a fresh run finishes.
+
+### The repo is at `mgreenspan17/...` but I want it under `manniegreenspan/...`
+
+That reflects the GitHub account the agent had access to. `manniegreenspan`
+is an Organization and the available token lacked admin on it. See
+[`TRANSFER.md`](TRANSFER.md) for the one-time UI transfer steps or the
+re-create-from-org-admin fallback.
