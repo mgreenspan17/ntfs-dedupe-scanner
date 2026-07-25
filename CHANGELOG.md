@@ -4,6 +4,139 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] - 2026-07-25
+
+### Changed
+
+Reviewer-driven correctness + docs polish from PR `#1` review findings
+(Codex + CodeRabbit + Copilot). No new top-level JSON fields beyond
+`logWriteFailed` is required for this drop; behaviour and observability
+improve on top of v0.4.0.
+
+### Fixed
+
+- **BLAKE3 + SHA256 records no longer share buckets.** `ScanRecord`
+  carries a new `HashAlgorithm` field stamped per record; the dedupe
+  pass now groups records by `(HashAlgorithm, Hash)` so a single
+  per-file SHA256 fallback can no longer change which BLAKE3 records
+  match each other. Schema is unchanged but grouping semantics are
+  documented in `docs/OUTPUT_SCHEMA.md` and `docs/ARCHITECTURE.md`.
+- **`b3sum` invokes can no longer deadlock on filled redirected
+  pipes.** `Blake3Hex` now drains stdout + stderr asynchronously
+  (`BeginOutputReadLine` + `OutputDataReceived` / `ErrorDataReceived`)
+  with `ManualResetEvent` waits on completion, then applies the 30 s
+  `WaitForExit` + `Kill` policy if the process hangs.
+- **Lazy enumeration access denials no longer abort the scan.**
+  `Enumerate` now passes `EnumerationOptions { IgnoreInaccessible = true }`
+  to `Directory.EnumerateFiles` / `EnumerateDirectories` so a single
+  locked folder cannot derail a full-volume walk.
+- **Final-file correctness.** `$bytesDone` and `$folderBytes` advance
+  even on hash failure so the last `100%` line, the remaining-bytes
+  number, and the ETA are accurate on the unreadable last file of a
+  folder. `$done` and `$attempted` are now tracked separately.
+- **First-file speed no longer pollutes peak.** The speed/ETA tick is
+  no longer forced on `$done -eq 1`; the first sample is taken at the
+  next normal 1-second boundary.
+- **Folder-bar auto-collapse renders exactly one 100% line.** The
+  in-place `\r + NoNewline` render is skipped on the last file of a
+  folder so the committing 100% line is the only row that lands.
+- **Log writes no longer silently lost.** `Write-ScanLog` records the
+  first append failure into `$Script:LogWriteFailed`, emits a one-time
+  `Write-Warning`, and carries the flag into the structured log
+  summary line and the script's return `PSCustomObject`.
+- **Concurrent runs no longer clobber each other's logs.** The
+  log filename now embeds the per-run `SessionId` so two scans started
+  in the same second do not truncate one another's audit trail.
+- **`Resolve-Path` is null-safe** before `.ProviderPath` is accessed
+  for `-LogDir`; an unresolvable log directory now throws a clear
+  error instead of a null-valued expression error.
+- **`Write-Warning` at the first BLAKE3 fallback is a single string**
+  (the previous `+` to concatenate a second sentence leaked the second
+  sentence on the success output stream).
+- **`EnumerationOptions` swap-in avoids `Add-Type` compile error on
+  Windows PowerShell 5.1 / .NET Framework 4.x.** The PS 5.1 C# compiler
+  pipeline does not resolve `System.IO.EnumerationOptions` reliably,
+  so the script now materialises the file + directory lists and wraps
+  each call in typed `try/catch` for `UnauthorizedAccessException`,
+  `DirectoryNotFoundException`, and `IOException`. Behaviour is
+  equivalent to `EnumerationOptions { IgnoreInaccessible = true }`
+  (a single locked folder can no longer abort the whole scan).
+- **JSON, CSV, and log file are all written without a UTF-8 BOM.**
+  `Out-File -Encoding UTF8`, `Export-Csv -Encoding UTF8`, AND
+  `Add-Content -Encoding UTF8` (used by the structured log helper)
+  all prepend a BOM (EF BB BF) in PS 5.1, which trips strict
+  downstream parsers (`json.load`, `pandas.read_csv` without
+  `encoding='utf-8-sig'`, jq, DuckDB csv, anything grepping for
+  a leading `[` in the file). The script now uses
+  `[System.IO.File]::WriteAllText` for JSON/CSV and
+  `[System.IO.File]::AppendAllText` for the log, both with an
+  explicit UTF-8-without-BOM encoding.
+- **`logWriteFailed=...` is now JSON-style lowercase** in the summary
+  log line. PowerShell's default `[bool].ToString()` returns
+  `"True"/"False"` (capitalized), so the v0.4.1 first cut produced
+  `logWriteFailed=False`. The script now resolves the value into
+  `$summaryLogWriteFailed` (`"true"` or `"false"`) before formatting
+  so log parsers reading for `logWriteFailed=true` keep working
+  without PowerShell-language special-casing.
+- **Bare `(if ...) ` value expression replaced with a local variable.**
+  PowerShell 5.1 does not support `(if A { 'a' } else { 'b' })` as a
+  value expression (that is a PowerShell 7+ feature). The summary log
+  line's `hashAlgorithmFallback` ternary is now resolved into
+  `$summaryAlgoFallback` first.
+- **Group `hash` field no longer carries an `"algo|" prefix`.** When
+  the duplicate pass was first switched to a `(HashAlgorithm, Hash)`
+  bucket key in the v0.4.1 draft, the script assigned the entire key
+  string (`"blake3|<hash>"`) to the JSON `groups[].hash` field. The
+  field is now split into `groups[].hashAlgorithm` (string) +
+  `groups[].hash` (64 hex chars) and `groups[]` returns clean values
+  dashboards can compare directly.
+
+### Added
+
+- `ScanRecord.HashAlgorithm` (`"blake3"` or `"sha256"`, additive; older
+  consumers can ignore it).
+- New top-level `attemptedFiles` field in the JSON payload
+  (`scannedFiles` keeps meaning "successful record count";
+  `attemptedFiles` includes per-file hash failures).
+- `$Script:LogWriteFailed` propagated into the summary log line as
+  `logWriteFailed=true` and into the script's return `PSCustomObject`
+  as a `logWriteFailed` boolean.
+- `$Script:Blake3FallbackCount` propagated into the return
+  `PSCustomObject` so callers can branch on fallback count without
+  re-reading the JSON.
+
+### Corrected
+
+- `README.md`, `docs/ARCHITECTURE.md`, `docs/OUTPUT_SCHEMA.md`,
+  `docs/USAGE.md`, and `docs/LOGGING.md` all updated so that:
+  - Markdown parameter + skipping tables no longer carry an extra
+    leading `|` per row.
+  - The example JSON `schemaVersion` is `1.0.1`, not `1.0.0`, and
+    the embedded embedded JSON example surfaces
+    `hashAlgorithmFallback`, `blake3FallbackCount`, and
+    `attemptedFiles`.
+  - The example `perFolder` entry uses lowercase keys (which is what
+    `ConvertTo-Json` actually emits), not PascalCase.
+  - The console + log cadence is documented accurately: console +
+    `Write-Progress` refresh every ~1 s; the structured log file
+    throttles speed + ETA snapshots to every ~5 s.
+  - The CSV `ConvertFrom-Csv` example passes
+    `-Header Timestamp, Level, Message` so the first log row is
+    treated as data, not as a header.
+  - Log files are described as **UTF-8 text** (BOM-free), not ASCII;
+    the per-folder progress bar is described as a Unicode
+    block-character bar (`█` U+2588 + `░` U+2591), not ASCII.
+  - `docs/ARCHITECTURE.md` no longer carries the duplicate
+    **Skipped paths** section that the codebase-cleanup linter
+    flagged.
+
+### Notes
+
+- Still read-only / Windows PowerShell 5.1 safe.
+- The JSON `schemaVersion` stays at `1.0.1` from v0.4.0: v0.4.1 is
+  additive, so consumers parsing `schemaVersion=1.0.1` output from
+  this branch keep working without changes.
+
 ## [0.4.0] - 2026-07-25
 
 ### Changed
@@ -47,8 +180,9 @@ All notable changes to this project are recorded here. The format follows
   - Real-time **ETA prediction** (rendered as `XXs`, `MM:SS`, or
     `HH:MM:SS`) refreshed from remaining bytes + instantaneous MB/s
     every ~1 s.
-  - **Per-folder** `[XXXXXXXXXX]` ASCII bar with auto-collapse to a
-    committed 100% line on completion.
+  - **Per-folder** Unicode block-character bar (`█` U+2588 + `░`
+    U+2591) with auto-collapse to a committed 100% line on
+    completion.
   - **Live throughput** display: instantaneous 1-s speed, 5-s moving
     average, and peak across the whole run
     (`Speed: 87 MB/s (avg 82 MB/s, peak 104 MB/s)`).

@@ -15,7 +15,10 @@ dashboards plus a CSV mirror for spreadsheet review.
 - **Fast:** 2-5 minutes on a populated `C:\` (NVMe + 8+ threads)
 - **Safe:** P/Invoke to `GetFileInformationByHandle` opens files with
   `FILE_SHARE_READ|WRITE|DELETE` and zero write access
-- **Hashing:** BLAKE3 when `b3sum` is on PATH, SHA256 (BCL) otherwise
+- **Hashing:** BLAKE3 when `b3sum` is on PATH; SHA256 (BCL) per-file
+  fallback when `b3sum` exits non-zero, times out, or prints to stderr.
+  Records stamped with which algorithm was used; duplicate groups keep
+  BLAKE3 and SHA256 digests in separate buckets
 - **Hard-link aware:** Groups with a single NTFS File ID are flagged
   `hardlinked: true` and excluded from wasted-byte totals
 - **Live UX:** real-time ETA, per-folder progress bar (auto-collapse),
@@ -49,15 +52,15 @@ After completion you'll find three artefacts:
 
 ## Parameters
 
-|| Parameter           | Default          | Notes                                          |
-||---------------------|------------------|------------------------------------------------|
-|| `-Path`             | `C:\`            | Root path to scan                              |
-|| `-OutputDir`        | `.\output`       | Where JSON + CSV are written                   |
-|| `-LogDir`           | `.\logs`         | Where the structured run log is written        |
-|| `-HashAlgorithm`    | `SHA256`         | `SHA256` or `BLAKE3` (needs `b3sum` on PATH)   |
-|| `-ThrottleLimit`    | `8`              | Reserved (per-file loop is sequential in 0.3.0)|
-|| `-IncludeSystemPaths` | off            | Include `System Volume Information` etc.       |
-|| `-DryRun`           | off              | Enumerate + total bytes; do not hash           |
+| Parameter             | Default      | Notes                                          |
+|-----------------------|--------------|------------------------------------------------|
+| `-Path`               | `C:\`        | Root path to scan                              |
+| `-OutputDir`          | `.\output`   | Where JSON + CSV are written                   |
+| `-LogDir`             | `.\logs`     | Where the structured run log is written        |
+| `-HashAlgorithm`      | `SHA256`     | `SHA256` or `BLAKE3` (needs `b3sum` on PATH)   |
+| `-ThrottleLimit`      | `8`          | Reserved (per-file loop is sequential in 0.3.0)|
+| `-IncludeSystemPaths` | off          | Include `System Volume Information` etc.       |
+| `-DryRun`             | off          | Enumerate + total bytes; do not hash           |
 
 ## Live UX (v0.3.0+)
 
@@ -77,14 +80,17 @@ See [`docs/USAGE.md`](docs/USAGE.md#live-ux) and
 
 ```json
 {
-  "schemaVersion": "1.0.0",
-  "session": { "id": "...", "name": "dedupe-...", "author": "Mannie Greenspan <Oz agent>" },
+  "schemaVersion": "1.0.1",
+  "session": { "id": "...", "name": "dedupe-...", "author": "agent:oz|mannie-greenspan|<sessionId>" },
   "scannedAt": "2026-07-25T14:34:58Z",
   "completedAt": "2026-07-25T14:39:11Z",
   "durationSeconds": 253,
   "path": "C:\\",
-  "hashAlgorithm": "SHA256",
-  "scannedFiles": 482103,
+  "hashAlgorithm": "BLAKE3",
+  "hashAlgorithmFallback": null,
+  "blake3FallbackCount": 0,
+  "scannedFiles": 482101,
+  "attemptedFiles": 482103,
   "duplicateGroups": 3127,
   "totalBytes": 4821038124,
   "totalWastedBytes": 18429384711,
@@ -94,8 +100,8 @@ See [`docs/USAGE.md`](docs/USAGE.md#live-ux) and
     "peak": 104.1
   },
   "perFolder": [
-    { "Path": "C:\\Users\\Mannie\\Photos", "Files": 1234, "Bytes": 5129381,
-      "DurationSec": 12.4, "FilesPerSec": 99.5 }
+    { "path": "C:\\Users\\Mannie\\Photos", "files": 1234, "bytes": 5129381,
+      "durationSec": 12.4, "filesPerSec": 99.5 }
   ],
   "topByWastedBytes": [ { ... }, ... ],
   "groups": [ { "hash": "...", "fileCount": 4, "uniqueInodes": 2,
@@ -103,9 +109,11 @@ See [`docs/USAGE.md`](docs/USAGE.md#live-ux) and
 }
 ```
 
-The `schemaVersion` stays at `1.0.0`; new fields are additive so older
-Warp dashboards keep parsing the same fields. See
-[`docs/OUTPUT_SCHEMA.md`](docs/OUTPUT_SCHEMA.md) for the full schema.
+The `schemaVersion` rolled from `1.0.0` to `1.0.1` in v0.4.0 to expose
+BLAKE3 -> SHA256 fallback observability; the new top-level fields are
+additive so older dashboards keep parsing the same fields. See
+[`docs/OUTPUT_SCHEMA.md`](docs/OUTPUT_SCHEMA.md) for the full schema and
+v1.0.0 -> v1.0.1 migration notes.
 
 ## Repository layout
 

@@ -8,13 +8,13 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\Invoke-NTFSDedupeScan.ps1
 
 Default behaviour:
 
-|- `-Path`               `C:\`
-|- `-OutputDir`          `.\output`
-|- `-LogDir`             `.\logs`
-|- `-HashAlgorithm`      `SHA256`
-|- `-ThrottleLimit`      `8` (reserved; per-file loop is sequential in 0.3.0)
-|- `-IncludeSystemPaths` `$false`
-|- `-DryRun`             `$false`
+- `-Path`:               `C:\`
+- `-OutputDir`:          `.\output`
+- `-LogDir`:             `.\logs`
+- `-HashAlgorithm`:      `SHA256`
+- `-ThrottleLimit`:      `8` (reserved; per-file loop is sequential in 0.3.0)
+- `-IncludeSystemPaths`: `$false`
+- `-DryRun`:             `$false`
 
 ## Common recipes
 
@@ -61,8 +61,15 @@ pwsh -File .\scripts\Invoke-NTFSDedupeScan.ps1 -DryRun
 
 ## Live UX (v0.3.0+)
 
-During a full scan the `Write-Progress` taskbar, the per-folder console
-line, and the structured log file all update together every ~1 s.
+Console + `Write-Progress` refresh together every ~1 s. The structured
+log file throttles speed + ETA snapshots to roughly every 5 s so the
+file does not balloon on a 5-minute full-volume run. Operationally:
+
+- **Console + `Write-Progress`**: ETA, throughput, per-folder bar all
+  refresh ~once per second.
+- **Structured log file**: speed + ETA snapshot rows appear ~once
+  every 5 s; folder start/complete, hashing complete, summary, and
+  error rows are emitted as they happen.
 
 ### ETA prediction
 
@@ -145,18 +152,23 @@ For log-parsing pipelines:
 Get-Content .\logs\ntfs-dedupe-scan-*.log |
     Where-Object { $_ -match '^\[' } |
     ForEach-Object { $_ -replace '^\[(\S+ \S+)\] (\S+) : (.+)$', '$1|$2|$3' } |
-    ConvertFrom-Csv -Delimiter '|'
+    ConvertFrom-Csv -Delimiter '|' -Header Timestamp, Level, Message
 ```
+
+The explicit `-Header Timestamp, Level, Message` is required because
+the log file's first matching row would otherwise be silently treated
+as the column header row.
 
 See [`docs/LOGGING.md`](LOGGING.md) for the full event vocabulary.
 
 ## Troubleshooting
 
-| Symptom                                          | Fix                                                |
-|--------------------------------------------------|----------------------------------------------------|
-| BLAKE3 module not loaded; falling back...        | Install `b3sum.exe` or stay on SHA256              |
-| Access denied on `C:\Windows\...`                | Add `-IncludeSystemPaths` (still read-only) or skip |
-| Hash is empty for large files                    | File was unreadable; check the source path         |
-| Output dir missing                               | The script creates it; ensure parent is writable   |
-| Log dir not appearing                            | Check `-LogDir` and ensure parent is writable      |
-| ETA stays at `--`                                | First ~1 s after `hashing start`; speed history warmup |
+| Symptom                            | Fix                                                                                   |
+|------------------------------------|---------------------------------------------------------------------------------------|
+| BLAKE3 module not loaded; fallback | Install `b3sum.exe` or stay on SHA256                                                 |
+| Access denied on `C:\Windows\...`  | Add `-IncludeSystemPaths` (still read-only) or skip                                  |
+| Hash is empty for large files      | File was unreadable; check the source path                                            |
+| Output dir missing                 | The script creates it; ensure parent is writable                                      |
+| Log dir not appearing              | Check `-LogDir` and ensure parent is writable                                         |
+| ETA stays at `--`                  | First ~1 s after `hashing start`; speed history warmup                                |
+| Summary says `logWriteFailed=true` | Log file could not be written (locked / unwritable); JSON + CSV still produced        |

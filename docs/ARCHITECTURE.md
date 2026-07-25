@@ -99,17 +99,17 @@ recover disk space, only re-link the same inode.
 
 Default skip-list (case-insensitive leaf comparison):
 
-| Leaf                          | Reason                                        |
-|-------------------------------|-----------------------------------------------|
+| Leaf                          | Reason                                      |
+|-------------------------------|---------------------------------------------|
 | `$Recycle.Bin`                | Recycle bin contents                          |
-| `System Volume Information`   | VSS / restore partition metadata, ACL-locked  |
-| `Config.Msi`                  | Windows Installer temp                        |
-| `MSOCache`                    | Office installer cache                        |
+| `System Volume Information`   | VSS / restore partition metadata, ACL-locked |
+| `Config.Msi`                  | Windows Installer temp                         |
+| `MSOCache`                    | Office installer cache                         |
 | `$WinREAgent`                 | WinRE staging                                 |
 | `WindowsApps`                 | Appx packages, byte-identical between users   |
 | `Recovery`                    | WinRE binaries                                |
 | `PerfLogs`                    | ETW circular logs                             |
-| `Documents and Settings`      | Junction                                       |
+| `Documents and Settings`      | Junction                                      |
 | `DumpStack.log.tmp`           | BSOD scratch                                  |
 
 Pass `-IncludeSystemPaths` to override.
@@ -132,25 +132,6 @@ Speed state is held in `$Script:` variables (`InstSpeed`, `AvgSpeed`,
 `PeakSpeed`, `LastTick`, `LastBytesDone`, `SpeedHistory`) and is
 refreshed every ~1 s by `Update-SpeedState`. ETA is recomputed at
 the same cadence from remaining bytes and instantaneous MB/s.
-
-### Skipped paths
-
-Default skip-list (case-insensitive leaf comparison):
-
-|| Leaf                          | Reason                                        |
-||-------------------------------|-----------------------------------------------|
-|| `$Recycle.Bin`                | Recycle bin contents                          |
-|| `System Volume Information`   | VSS / restore partition metadata, ACL-locked  |
-|| `Config.Msi`                  | Windows Installer temp                        |
-|| `MSOCache`                    | Office installer cache                        |
-|| `$WinREAgent`                 | WinRE staging                                 |
-|| `WindowsApps`                 | Appx packages, byte-identical between users   |
-|| `Recovery`                    | WinRE binaries                                |
-|| `PerfLogs`                    | ETW circular logs                             |
-|| `Documents and Settings`      | Junction                                      |
-|| `DumpStack.log.tmp`           | BSOD scratch                                  |
-
-Pass `-IncludeSystemPaths` to override.
 
 ### Provenance
 

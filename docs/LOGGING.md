@@ -5,20 +5,26 @@ structured text log in addition to the JSON/CSV artefacts.
 
 ## Where
 
-| File                                         | Default |
-|----------------------------------------------|---------|
-| `./logs/ntfs-dedupe-scan-<timestamp>.log`    | `./logs` |
+| File                                                       | Default   |
+|------------------------------------------------------------|-----------|
+| `./logs/ntfs-dedupe-scan-<timestamp>-<sessionId>.log`      | `./logs`  |
 
 `timestamp` is `yyyyMMddTHHmmss` (UTC-naive, local time machine clock).
 A second parameter `-LogDir` lets you redirect the log to any folder.
+`<sessionId>` is the per-run UUID so that two runs started in the same
+second cannot clobber each other's log.
 
-If a log with the same timestamp already exists (rare machine-clock
-collision), the file is truncated before writing so each run starts
-with a fresh stream.
+Each line is a **UTF-8** text record (the script writes the file via
+`[System.IO.File]::AppendAllText` with `UTF8Encoding($false)`), so
+paths and messages may contain non-ASCII characters and should be
+decoded as UTF-8 by any reader. The Windows-format UTF-8 BOM (EF BB BF)
+that `Add-Content -Encoding UTF8` would prepend on the first call of
+each run is explicitly avoided so the file stays grep-friendly for
+`jq`, `awk`, and `pandas`.
 
 ## Format
 
-Each line is a flat ASCII record, one per event:
+Each line is a flat **UTF-8** text record (no BOM), one per event:
 
 ```
 [YYYY-MM-DD HH:MM:SS] LEVEL : message
@@ -92,8 +98,12 @@ manifest of the run. Differences are intentional:
 
 ## Failures
 
-The `Write-ScanLog` helper wraps `Add-Content` in a `try/catch` so a
-locked/unwritable log file does not abort the scan. Look for the line
-prefix `[timestamp] ERROR : ...` only when the script emits WARN or
-ERROR directly (none today); the *missing* log file itself is the
-canonical signal that the run could not write the log.
+The `Write-ScanLog` helper wraps each `AppendAllText` call in a
+`try/catch` so a locked or unwritable log file does not abort the
+scan. If the very first append fails, the helper emits a one-time
+`Write-Warning`, sets a `$Script:LogWriteFailed` flag, and keeps the
+scan running with all subsequent log events dropped. The flag is part
+of the script's return `PSCustomObject` and also appears in the
+structured log summary line as `logWriteFailed=true` (or `false`)
+so downstream consumers can see whether the audit trail was
+incomplete even though JSON + CSV still landed.

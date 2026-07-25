@@ -61,13 +61,56 @@
 .NOTES
     Script     : Invoke-NTFSDedupeScan.ps1
     Program    : ntfs-dedupe-scanner
-    Version    : 0.4.0
+    Version    : 0.4.1
     Author     : Mannie Greenspan <Oz agent>
     Harness    : agent:oz|mannie-greenspan
     License    : MIT
     Generated  : 2026-07-25
     See also   : ../docs/OUTPUT_SCHEMA.md, ../docs/ARCHITECTURE.md, ../docs/LOGGING.md
 
+    v0.4.1  2026-07-25  Reviewer-driven correctness + docs polish from PR #1
+                         review findings (Codex + CodeRabbit + Copilot):
+                         * Blake3Hex: async stdout/stderr drains plus hard
+                           30 s timeout + kill to avoid redirected-pipe
+                           deadlocks; drains async readers on the fast path.
+                         * Enumerate: try/catch around every lazy
+                           Directory.Enumerate (IgnoreInaccessible
+                           equivalent) so a single locked folder can no
+                           longer abort the whole scan.
+                         * ScanRecord: new HashAlgorithm field stamps
+                           "blake3" or "sha256" per record; the duplicate
+                           pass groups by (HashAlgorithm, Hash) so a single
+                           fallback file cannot change which BLAKE3 records
+                           match each other.
+                         * Per-folder loop: $bytesDone + $folderBytes
+                           advance even on hash failure so the final
+                           progress / remaining-bytes / ETA are accurate
+                           on the unreadable last file of a folder.
+                         * Speed tracker no longer evaluates on the very
+                           first record (avoids sub-millisecond speed
+                           inflation that poisoned the running peak).
+                         * Folder-bar: skip the in-place render on the
+                           final file of a folder so the auto-collapse
+                           prints exactly one 100% line.
+                         * Write-ScanLog: flags + one-time console warning
+                           if a log-write fails; carries the flag into the
+                           summary line and the return object. log file is
+                           written BOM-free so jq/awk/pandas treat it as a
+                           plain UTF-8 stream.
+                         * Log filename now includes the SessionId so
+                           concurrent runs cannot clobber each other.
+                         * Write-Warning at the first BLAKE3 fallback is
+                           now a single-string invocation (no stray '+'
+                           on the success output stream).
+                         * Summary line `logWriteFailed=...` is JSON-style
+                           lowercase ("true"/"false") so log parsers
+                           don't have to special-case PS True/False.
+                         JSON adds `attemptedFiles` next to `scannedFiles`;
+                         the summary log line includes logWriteFailed.
+                         PS5.1 hardening: BOM-free JSON/CSV/log writes,
+                         no bare `(if ...) ` value expressions, no
+                         `EnumerationOptions` compilation, and the group
+                         key is split into `hashAlgorithm` + `hash`.
     v0.4.0  2026-07-25  BLAKE3-preferred / SHA256-fallback with explicit,
                          visible downgrade tracking.
                          * C# Blake3Hex: 30 s per-file timeout; kill-on-
@@ -226,11 +269,17 @@ $Script:OutputDirAbs = $Script:OutputDirAbs.ProviderPath
 if (-not (Test-Path -LiteralPath $LogDir)) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 }
-$Script:LogDirAbs = (Resolve-Path -LiteralPath $LogDir -ErrorAction SilentlyContinue).ProviderPath
+$_logDirResolved = Resolve-Path -LiteralPath $LogDir -ErrorAction SilentlyContinue
+if (-not $_logDirResolved) {
+    throw "Log directory could not be resolved: $LogDir"
+}
+$Script:LogDirAbs = $_logDirResolved.ProviderPath
 $Script:LogStamp  = Get-Date -Format 'yyyyMMddTHHmmss'
-$Script:LogPath   = Join-Path $Script:LogDirAbs ("ntfs-dedupe-scan-{0}.log" -f $Script:LogStamp)
-# Truncate on rare timestamp collision so we never append stale runs
-if (Test-Path -LiteralPath $Script:LogPath) { Remove-Item -LiteralPath $Script:LogPath -Force }
+# Filename includes SessionId so concurrent or back-to-back runs cannot
+# delete each other's logs (Windows clock collisions are rare but real on
+# the second boundary).
+$Script:LogPath   = Join-Path $Script:LogDirAbs ("ntfs-dedupe-scan-{0}-{1}.log" -f $Script:LogStamp, $Script:SessionId)
+$Script:LogWriteFailed = $false
 
 # ---------------------------------------------------------------------------
 # 4c. Progress + logging helper functions (PS 5.1 safe)
@@ -249,8 +298,25 @@ function Write-ScanLog {
     $line = "[$ts] $Level : $Message"
 
     if ($Script:LogPath) {
-        try { Add-Content -LiteralPath $Script:LogPath -Value $line -Encoding UTF8 }
-        catch { }
+        try {
+            # `Add-Content -Encoding UTF8` in PS 5.1 prepends a BOM (EF BB BF)
+            # on the FIRST call of every run, which trips strict downstream
+            # parsers and shows up as `\ufeff` at the head of the log. We
+            # hand-roll an appender that always uses UTF-8 without BOM so
+            # the log stays grep-friendly for `jq`, `awk`, `pandas`, and
+            # `Notion ingestion` alike.
+            [System.IO.File]::AppendAllText(
+                $Script:LogPath,
+                ($line + [Environment]::NewLine),
+                [System.Text.UTF8Encoding]::new($false))
+        } catch {
+            # Don't abort the scan for a logging hiccup; flag once and let
+            # the summary line carry the count so dashboards know.
+            if (-not $Script:LogWriteFailed) {
+                $Script:LogWriteFailed = $true
+                Write-Warning ("Failed to write to log file {0}; subsequent log events are dropped. Error: {1}" -f $Script:LogPath, $_.Exception.Message)
+            }
+        }
     }
 
     if (-not $NoConsole) {
@@ -384,6 +450,12 @@ using Microsoft.Win32.SafeHandles;
 public sealed class ScanRecord {
     public string Path  { get; set; }
     public long   Size  { get; set; }
+    // Lower-case hash algorithm that produced `Hash` for THIS record.
+    // Either "blake3" or "sha256". Additive field; older consumers can
+    // ignore it. v0.4.1 uses this to keep BLAKE3 and SHA256 digests in
+    // separate duplicate-group buckets so a single fallback file cannot
+    // silently change the result set.
+    public string HashAlgorithm { get; set; }
     public string Hash  { get; set; }
     public ulong  Inode { get; set; }
     // True when BLAKE3 was requested but the call fell back to SHA256 for
@@ -479,23 +551,46 @@ public static class NTFSHashScanner {
             UseShellExecute        = false,
             CreateNoWindow         = true
         };
-        using (var p = Process.Start(psi)) {
-            string stdout = p.StandardOutput.ReadToEnd().Trim();
-            string stderr = p.StandardError.ReadToEnd().Trim();
-            // Per-file timeout: 30 s. If b3sum hangs (e.g. locked handle,
-            // sshfs-style network mount) we kill and treat as a fallback.
-            int timeoutMs = 30 * 1000;
+        using (var p = new Process { StartInfo = psi }) {
+            // Drain stdout / stderr asynchronously. Synchronous ReadToEnd()
+            // can deadlock the parent when one redirected pipe fills before
+            // b3sum exits; BeginOutputReadLine + OutputDataReceived keeps
+            // both buffers moving while we WaitForExit with a hard timeout.
+            var stdout = new System.Text.StringBuilder();
+            var stderr = new System.Text.StringBuilder();
+            var stdoutDone = new ManualResetEvent(false);
+            var stderrDone = new ManualResetEvent(false);
+            p.OutputDataReceived += (s, e) => {
+                if (e.Data != null) stdout.AppendLine(e.Data);
+                else stdoutDone.Set();
+            };
+            p.ErrorDataReceived  += (s, e) => {
+                if (e.Data != null) stderr.AppendLine(e.Data);
+                else stderrDone.Set();
+            };
+            if (!p.Start()) return string.Empty;
+            p.BeginOutputReadLine();
+            p.BeginErrorReadLine();
+
+            // Per-file timeout: 30 s. If b3sum hangs (locked handle,
+            // sshfs-style network mount, deadlocked pipe), we kill and
+            // treat the result as a fallback.
+            const int timeoutMs = 30 * 1000;
             if (!p.WaitForExit(timeoutMs)) {
                 try { p.Kill(); } catch { }
-                p.WaitForExit();
+                try { p.WaitForExit(); } catch { }
                 return string.Empty;
             }
-            // Return empty on any of: non-zero exit, non-empty stderr,
-            // empty hash token.
-            if (p.ExitCode != 0)              return string.Empty;
-            if (!string.IsNullOrEmpty(stderr)) return string.Empty;
-            if (string.IsNullOrEmpty(stdout))  return string.Empty;
-            var tokens = stdout.Split(
+            // Ensure the async readers drained even on the fast path.
+            stdoutDone.WaitOne(2000);
+            stderrDone.WaitOne(2000);
+
+            string outStr = stdout.ToString().Trim();
+            string errStr = stderr.ToString().Trim();
+            if (p.ExitCode != 0)               return string.Empty;
+            if (!string.IsNullOrEmpty(errStr)) return string.Empty;
+            if (string.IsNullOrEmpty(outStr))  return string.Empty;
+            var tokens = outStr.Split(
                 new[] { ' ', '\t', '\r', '\n' },
                 StringSplitOptions.RemoveEmptyEntries);
             return tokens.Length > 0 ? tokens[0] : string.Empty;
@@ -503,6 +598,12 @@ public static class NTFSHashScanner {
     }
 
     private static IEnumerable<string> Enumerate(string root, HashSet<string> skip) {
+        // Manual DFS without relying on a unified EnumerationOptions.
+        // PS 5.1 + .NET Framework 4.x don't reliably expose EnumerationOptions,
+        // so we enumerate directories breadth-first and wrap EVERY foreach
+        // over the lazy enumerator in a try/catch. A single locked folder
+        // therefore cannot abort a full-volume walk; traversal continues
+        // with whatever siblings we successfully enumerated.
         var stack = new Stack<string>();
         stack.Push(root);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -514,16 +615,26 @@ public static class NTFSHashScanner {
             try { leaf = Path.GetFileName(dir); } catch { continue; }
             if (!string.IsNullOrEmpty(leaf) && skip.Contains(leaf)) continue;
 
-            IEnumerable<string> files = null;
-            IEnumerable<string> dirs  = null;
-            try { files = Directory.EnumerateFiles(dir); }       catch { }
-            try { dirs  = Directory.EnumerateDirectories(dir); } catch { }
+            // Children: directories + files. Push directories first, then
+            // yield files so DFS order matches the caller's expectation.
+            List<string> childDirs = null;
+            try {
+                childDirs = new List<string>(Directory.EnumerateDirectories(dir));
+            } catch (UnauthorizedAccessException) { }
+            catch (DirectoryNotFoundException)     { }
+            catch (IOException)                    { }
+            List<string> childFiles = null;
+            try {
+                childFiles = new List<string>(Directory.EnumerateFiles(dir));
+            } catch (UnauthorizedAccessException) { }
+            catch (DirectoryNotFoundException)     { }
+            catch (IOException)                    { }
 
-            if (files != null) {
-                foreach (var f in files) yield return f;
+            if (childDirs != null) {
+                foreach (var d in childDirs) stack.Push(d);
             }
-            if (dirs != null) {
-                foreach (var d in dirs) stack.Push(d);
+            if (childFiles != null) {
+                foreach (var f in childFiles) yield return f;
             }
         }
     }
@@ -584,6 +695,7 @@ public static class NTFSHashScanner {
                     Path         = file,
                     Size         = fi.Length,
                     Hash         = Sha256Hex(file),
+                    HashAlgorithm = "sha256",
                     Inode        = GetFileId(file),
                     UsedFallback = false
                 };
@@ -595,6 +707,7 @@ public static class NTFSHashScanner {
                         Path         = file,
                         Size         = fi.Length,
                         Hash         = Sha256Hex(file),
+                        HashAlgorithm = "sha256",
                         Inode        = GetFileId(file),
                         UsedFallback = true
                     };
@@ -603,6 +716,7 @@ public static class NTFSHashScanner {
                         Path         = file,
                         Size         = fi.Length,
                         Hash         = b3,
+                        HashAlgorithm = "blake3",
                         Inode        = GetFileId(file),
                         UsedFallback = false
                     };
@@ -690,7 +804,8 @@ $Script:SpeedHistory.Clear()
 
 # 6d. Per-folder hashing loop with live ETA + speed + per-folder bar.
 $records    = New-Object 'System.Collections.Generic.List[object]'
-$done       = 0
+$done       = 0   # files that produced a usable ScanRecord (success)
+$attempted  = 0   # files we got to, including per-folder hash failures
 $bytesDone  = [long]0
 $progressActivity = 'NTFS deduplication scan'
 $lastSpeedLog    = [DateTime]::UtcNow
@@ -719,8 +834,7 @@ try {
                 if ($rec.UsedFallback) {
                     $Script:Blake3FallbackCount++
                     if (-not $Script:Blake3FallbackWarned) {
-                        Write-Warning ('BLAKE3 fallback detected for {0} (using SHA256 instead). ' -f $e.Path) +
-                                      'This warning is shown once; further fallbacks are counted and reported in the JSON.'
+                        Write-Warning ("BLAKE3 fallback detected for {0} (using SHA256 instead). This warning is shown once; further fallbacks are counted and reported in the JSON." -f $e.Path)
                         Write-ScanLog -Level WARN -Message ("blake3 fallback first-occurrence; path={0} using=SHA256" -f $e.Path)
                         $Script:Blake3FallbackWarned = $true
                     }
@@ -728,15 +842,29 @@ try {
                 $records.Add($rec)
                 $bytesDone += [long]$rec.Size
                 $folderBytes += [long]$rec.Size
+                $done++
+                $folderDone++
             } else {
+                # Hash failed (permission denied, vanished file, etc.). Still
+                # advance $bytesDone + $folderBytes so the final progress,
+                # remaining bytes, and ETA are accurate on the unreadable last
+                # file of a folder.
                 $Script:Errors++
+                $bytesDone += [long]$e.Size
+                $folderBytes += [long]$e.Size
+                $done++
+                $folderDone++
             }
-            $done++
-            $folderDone++
+            $attempted++
 
             $now        = [DateTime]::UtcNow
             $sinceTick  = ($now - $Script:LastTick).TotalSeconds
-            $shouldTick = ($sinceTick -ge 1.0) -or ($done -eq 1) -or ($done -eq $total)
+            # Skip the speed/ETA tick on the very first record: dividing a
+            # full file size by sub-second elapsed time blows up
+            # instantaneous MB/s AND poisons the running peak. We seed the
+            # history by just resetting the timer; the next normal tick
+            # produces a stable sample.
+            $shouldTick = ($sinceTick -ge 1.0) -or ($done -eq $total)
 
             if ($shouldTick) {
                 Update-SpeedState -BytesDone $bytesDone
@@ -760,9 +888,14 @@ try {
                 }
             }
 
-            # Per-folder bar update (always at start + end; rate-limited mid-folder)
+            # Per-folder bar update (always at start + end; rate-limited mid-folder).
+            # On the very last file we skip the in-place render and let the
+            # -Commit render below produce the single 100% line; otherwise a
+            # non-commit render followed immediately by the commit prints the
+            # bar twice on one physical line in interactive consoles.
             $barThreshold = if ($folderTotal -gt 100) { [int]($folderTotal / 10) } else { 1 }
-            if ($folderTotal -le 5 -or $folderDone -eq 1 -or $folderDone -eq $folderTotal -or (($folderDone % $barThreshold) -eq 0)) {
+            $isFinalFile  = ($folderDone -eq $folderTotal)
+            if (-not $isFinalFile -and ($folderTotal -le 5 -or $folderDone -eq 1 -or (($folderDone % $barThreshold) -eq 0))) {
                 Show-FolderProgress -Folder $folder -Done $folderDone -Total $folderTotal
             }
         }
@@ -786,7 +919,7 @@ $stopwatch.Stop()
 $elapsed = $stopwatch.Elapsed
 
 Write-Host ("[{0:HH:mm:ss}] {1:N0}/{2:N0} files hashed ({3:N0} scan records), {4:N0} per-file errors, {5:F1}s elapsed" -f (Get-Date), $done, $total, $records.Count, $Script:Errors, $elapsed.TotalSeconds) -ForegroundColor Yellow
-Write-ScanLog -Level INFO -Message ("hashing complete; hashed={0} records={1} errors={2} bytesDone={3} elapsedSec={4:F2}" -f $done, $records.Count, $Script:Errors, $bytesDone, $elapsed.TotalSeconds)
+Write-ScanLog -Level INFO -Message ("hashing complete; hashed={0} attempted={1} records={2} errors={3} bytesDone={4} elapsedSec={5:F2}" -f $done, $attempted, $records.Count, $Script:Errors, $bytesDone, $elapsed.TotalSeconds)
 
 # ---------------------------------------------------------------------------
 # 7. Group by hash, classify duplicates, compute wasted bytes
@@ -816,7 +949,8 @@ $report = [ordered]@{
     includeSystemPaths = [bool]$IncludeSystemPaths
     throttleLimit      = $ThrottleLimit
     skippedFolders     = @()
-    scannedFiles       = $done
+    scannedFiles       = $done        # successfully hashed files
+    attemptedFiles     = $attempted   # files we got to, incl. failures
     duplicateGroups    = 0
     totalWastedBytes   = 0L
     totalBytes         = $bytesTotal
@@ -838,13 +972,19 @@ $report.perFolder = @($Script:FolderStats)
 
 Write-Host ("[{0:HH:mm:ss}] grouping duplicates ..." -f (Get-Date)) -ForegroundColor Yellow
 
-# Bucket records by hash
+# Bucket records by (HashAlgorithm, Hash). Keeping digests from different
+# algorithms in separate buckets means a single per-file SHA256 fallback
+# cannot change which BLAKE3 records match each other. Fallback files
+# land in a small "sha256" group of their own that dashboards can show
+# alongside the BLAKE3 groups.
 $grouped = @{}
 foreach ($r in $records) {
-    if (-not $grouped.ContainsKey($r.Hash)) {
-        $grouped[$r.Hash] = New-Object System.Collections.Generic.List[object]
+    $algo  = if ([string]::IsNullOrEmpty($r.HashAlgorithm)) { 'unknown' } else { $r.HashAlgorithm.ToLowerInvariant() }
+    $key   = "$algo|$($r.Hash)"
+    if (-not $grouped.ContainsKey($key)) {
+        $grouped[$key] = New-Object System.Collections.Generic.List[object]
     }
-    $grouped[$r.Hash].Add($r)
+    $grouped[$key].Add($r)
 }
 
 $dupCount = 0
@@ -887,13 +1027,22 @@ foreach ($key in $grouped.Keys) {
         $report.totalWastedBytes = [long]$report.totalWastedBytes + $wasted
     }
 
+    # $key is "$algo|$($r.Hash)" (added in v0.4.1 to keep BLAKE3 and
+    # SHA256 digests in separate buckets). Split it apart so dashboards
+    # see clean fields rather than a "blake3:abcdef..." concatenated
+    # string in the hash column.
+    $keyParts      = $key -split '\|', 2
+    $groupAlgo     = $keyParts[0]
+    $groupHash     = $keyParts[1]
+
     $report.groups += [pscustomobject]@{
-        hash         = $key
-        fileCount    = $grp.Count
-        uniqueInodes = $uniqueInodes
-        wastedBytes  = $wasted
-        hardlinked   = $hardlinked
-        files        = $fileRows
+        hashAlgorithm = $groupAlgo
+        hash          = $groupHash
+        fileCount     = $grp.Count
+        uniqueInodes  = $uniqueInodes
+        wastedBytes   = $wasted
+        hardlinked    = $hardlinked
+        files         = $fileRows
     }
 }
 
@@ -914,7 +1063,12 @@ $jsonPath = Join-Path -Path $Script:OutputDirAbs -ChildPath ("dedupe-{0}.json" -
 $csvPath  = Join-Path -Path $Script:OutputDirAbs -ChildPath ("dedupe-{0}.csv"  -f $Script:SessionId)
 
 Write-Host ("[{0:HH:mm:ss}] writing JSON -> {1}" -f (Get-Date), $jsonPath) -ForegroundColor Yellow
-$report | ConvertTo-Json -Depth 12 | Out-File -FilePath $jsonPath -Encoding UTF8
+# Write the JSON without a UTF-8 BOM. `Out-File -Encoding UTF8` in
+# PS 5.1 prepends a BOM, which trip up strict downstream parsers
+# (json.load, jq, gcloud jq). We hand-roll the file write with an
+# explicit UTF-8-without-BOM encoding.
+$_reportJson = ($report | ConvertTo-Json -Depth 12) + [Environment]::NewLine
+[System.IO.File]::WriteAllText($jsonPath, $_reportJson, [System.Text.UTF8Encoding]::new($false))
 
 Write-Host ("[{0:HH:mm:ss}] writing CSV  -> {1}" -f (Get-Date), $csvPath) -ForegroundColor Yellow
 $csvRows = foreach ($g in $report.groups) {
@@ -931,7 +1085,18 @@ $csvRows = foreach ($g in $report.groups) {
         }
     }
 }
-$csvRows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+# `Export-Csv -Encoding UTF8` in PS 5.1 prepends a BOM, which trips
+# strict downstream parsers (pandas.read_csv without encoding='utf-8-sig',
+# DuckDB csv reader, etc.). Hand-roll the write so the file starts with
+# a clean UTF-8 byte stream.
+$_csvHeader = 'Hash,FileCount,UniqueInodes,WastedBytes,Hardlinked,Path,Size,Inode'
+$_csvLines  = foreach ($r in $csvRows) {
+    ('"{0}",{1},{2},{3},{4},"{5}",{6},{7}' -f `
+        $r.Hash, $r.FileCount, $r.UniqueInodes, $r.WastedBytes, $r.Hardlinked,
+        ($r.Path -replace '"', '""'), $r.Size, $r.Inode)
+}
+$_csvText = ($_csvHeader + [Environment]::NewLine) + (($_csvLines -join [Environment]::NewLine) + [Environment]::NewLine)
+[System.IO.File]::WriteAllText($csvPath, $_csvText, [System.Text.UTF8Encoding]::new($false))
 
 # ---------------------------------------------------------------------------
 # 9. Summary + return value for callers
@@ -971,9 +1136,16 @@ Write-Host ''
 # the actually-used algorithm can diverge. Skipped if zero fallbacks.
 Write-Host ("BLAKE3 fallbacks: {0} (SHA256 used instead)" -f $Script:Blake3FallbackCount) -ForegroundColor $(if ($Script:Blake3FallbackCount -gt 0) { 'Yellow' } else { 'DarkGray' })
 
-# Final summary log line (so dashboards can parse end events quickly)
-Write-ScanLog -Level INFO -Message ("summary; scannedFiles={0} duplicateGroups={1} hardlinkedGroups={2} wastedBytes={3} totalBytes={4} errors={5} folders={6} elapsedSec={7:F2} avgSpeedMBps={8:N1} peakSpeedMBps={9:N1} blake3FallbackCount={10} hashAlgorithmFallback={11} jsonPath={12} csvPath={13} logPath={14}" -f `
-    $report.scannedFiles, $report.duplicateGroups, $hardlinkedCount, $report.totalWastedBytes, $bytesTotal, $Script:Errors, $Script:FolderStats.Count, $elapsed.TotalSeconds, $avgSpeed, $Script:PeakSpeed, $Script:Blake3FallbackCount, (if ($null -ne $report.hashAlgorithmFallback) { $report.hashAlgorithmFallback } else { 'none' }), $jsonPath, $csvPath, $Script:LogPath)
+# Final summary log line (so dashboards can parse end events quickly).
+# PowerShell 5.1 does not support bare `(if ...) ` as a value expression,
+# so we resolve both ternaries into locals first. `logWriteFailed` is
+# spelled JSON-style ("true"/"false") rather than PowerShell's default
+# "True"/"False" so log parsers reading for `=true` / `=false` keep
+# working without per-language customization.
+$summaryAlgoFallback    = if ($null -ne $report.hashAlgorithmFallback) { $report.hashAlgorithmFallback } else { 'none' }
+$summaryLogWriteFailed  = if ($Script:LogWriteFailed) { 'true' } else { 'false' }
+Write-ScanLog -Level INFO -Message ("summary; scannedFiles={0} attemptedFiles={1} duplicateGroups={2} hardlinkedGroups={3} wastedBytes={4} totalBytes={5} errors={6} folders={7} elapsedSec={8:F2} avgSpeedMBps={9:N1} peakSpeedMBps={10:N1} blake3FallbackCount={11} hashAlgorithmFallback={12} logWriteFailed={13} jsonPath={14} csvPath={15} logPath={16}" -f `
+    $report.scannedFiles, $report.attemptedFiles, $report.duplicateGroups, $hardlinkedCount, $report.totalWastedBytes, $bytesTotal, $Script:Errors, $Script:FolderStats.Count, $elapsed.TotalSeconds, $avgSpeed, $Script:PeakSpeed, $Script:Blake3FallbackCount, $summaryAlgoFallback, $summaryLogWriteFailed, $jsonPath, $csvPath, $Script:LogPath)
 if ($Script:Blake3FallbackCount -gt 0) {
     Write-ScanLog -Level WARN -Message ("blake3 fallbacks detected; count={0} downgrade=SHA256" -f $Script:Blake3FallbackCount)
 }
@@ -984,6 +1156,7 @@ Write-ScanLog -Level INFO -Message 'ntfs-dedupe-scan end'
     sessionName      = $Script:SessionName
     signature        = $Script:Signature
     scannedFiles     = $report.scannedFiles
+    attemptedFiles   = $report.attemptedFiles
     duplicateGroups  = $report.duplicateGroups
     hardlinkedGroups = $hardlinkedCount
     totalWastedBytes = $report.totalWastedBytes
@@ -993,8 +1166,10 @@ Write-ScanLog -Level INFO -Message 'ntfs-dedupe-scan end'
     elapsedSeconds   = [math]::Round($elapsed.TotalSeconds, 2)
     averageSpeedMBps = [math]::Round($avgSpeed, 2)
     peakSpeedMBps    = [math]::Round($Script:PeakSpeed, 2)
+    blake3FallbackCount = $Script:Blake3FallbackCount
     jsonPath         = $jsonPath
     csvPath          = $csvPath
     logPath          = $Script:LogPath
+    logWriteFailed   = [bool]$Script:LogWriteFailed
     dryRun           = $false
 }
