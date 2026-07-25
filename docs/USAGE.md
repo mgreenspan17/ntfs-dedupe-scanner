@@ -8,12 +8,13 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\Invoke-NTFSDedupeScan.ps1
 
 Default behaviour:
 
-- `-Path`             `C:\`
-- `-OutputDir`        `.\output`
-- `-HashAlgorithm`    `SHA256`
-- `-ThrottleLimit`    `8`
-- `-IncludeSystemPaths` `$false`
-- `-DryRun`           `$false`
+- `-Path`:               `C:\`
+- `-OutputDir`:          `.\output`
+- `-LogDir`:             `.\logs`
+- `-HashAlgorithm`:      `SHA256`
+- `-ThrottleLimit`:      `8` (reserved; per-file loop is sequential in 0.3.0)
+- `-IncludeSystemPaths`: `$false`
+- `-DryRun`:             `$false`
 
 ## Common recipes
 
@@ -58,22 +59,81 @@ List everything that would be hashed without actually hashing:
 pwsh -File .\scripts\Invoke-NTFSDedupeScan.ps1 -DryRun
 ```
 
+## Live UX (v0.3.0+)
+
+Console + `Write-Progress` refresh together every ~1 s. The structured
+log file throttles speed + ETA snapshots to roughly every 5 s so the
+file does not balloon on a 5-minute full-volume run. Operationally:
+
+- **Console + `Write-Progress`**: ETA, throughput, per-folder bar all
+  refresh ~once per second.
+- **Structured log file**: speed + ETA snapshot rows appear ~once
+  every 5 s; folder start/complete, hashing complete, summary, and
+  error rows are emitted as they happen.
+
+### ETA prediction
+
+```text
+ETA: 1:23        # 1 min 23 s remaining
+ETA: 45s         # < 60 s
+ETA: 2:14:09     # >= 1 h
+ETA: --          # not yet estimable (no throughput yet)
+```
+
+ETA = remaining bytes / instantaneous MB/s. The renderer
+(`Format-Eta`) follows the spec:
+
+- < 60 s → `XXs`
+- < 60 min → `MM:SS`
+- otherwise → `HH:MM:SS`
+
+### Per-folder progress bar
+
+Each parent folder draws a 10-block ASCII bar in place (via `\r` +
+`NoNewline`) and commits a final 100% line on completion — that line
+scrolls up into the buffer, so each folder takes a single visual row
+once the scan has moved past it.
+
+```text
+[████████░░]  80% (45/56 files) C:\Users\manni\Photos
+[██████████] 100% (56/56 files) C:\Users\manni\Photos
+[███░░░░░░░]  30% (12/40 files) C:\Users\manni\Documents
+```
+
+Pattern uses `█` (U+2588) and `░` (U+2591).
+
+### Live throughput
+
+```text
+Speed: 87 MB/s (avg 82 MB/s, peak 104 MB/s)
+```
+
+- **instantaneous** — round-up printed every ~1 s
+- **average5s** — moving average over the last 5 s
+- **peak** — highest instantaneous speed observed during the run
+
+The same numbers land in `JSON.speedMBps` for dashboarding.
+
 ## Returns
 
-The script writes JSON and CSV into the output directory and prints:
+The script writes JSON, CSV, and a log file and prints:
 
 - Number of files scanned
 - Number of duplicate groups
 - Wasted bytes (formatted as GB)
-- Paths to the JSON and CSV files
+- Total bytes (formatted as GiB)
+- Per-file errors, elapsed seconds, average + peak speed
 
-It returns a structured `PSCustomObject` (`$Result`) with the same
-counts so you can pipe it to other scripts:
+It returns a structured `PSCustomObject` (`$Result`) so you can pipe
+it to other scripts:
 
 ```powershell
 $result = & pwsh -File .\scripts\Invoke-NTFSDedupeScan.ps1 -Path .\sample-data
 $result.duplicateGroups
 $result.totalWastedBytes
+$result.averageSpeedMBps
+$result.peakSpeedMBps
+$result.logPath
 ```
 
 ## Scheduling
@@ -86,11 +146,29 @@ $json = Get-Content .\output\dedupe-*.json -Raw | ConvertFrom-Json
 $json | ConvertTo-Json -Depth 6 | Set-Clipboard  # paste into a Warp card
 ```
 
+For log-parsing pipelines:
+
+```powershell
+Get-Content .\logs\ntfs-dedupe-scan-*.log |
+    Where-Object { $_ -match '^\[' } |
+    ForEach-Object { $_ -replace '^\[(\S+ \S+)\] (\S+) : (.+)$', '$1|$2|$3' } |
+    ConvertFrom-Csv -Delimiter '|' -Header Timestamp, Level, Message
+```
+
+The explicit `-Header Timestamp, Level, Message` is required because
+the log file's first matching row would otherwise be silently treated
+as the column header row.
+
+See [`docs/LOGGING.md`](LOGGING.md) for the full event vocabulary.
+
 ## Troubleshooting
 
-| Symptom                                          | Fix                                                |
-|--------------------------------------------------|----------------------------------------------------|
-| BLAKE3 module not loaded; falling back...        | Install `b3sum.exe` or stay on SHA256              |
-| Access denied on `C:\Windows\...`                | Add `-IncludeSystemPaths` (still read-only) or skip |
-| Hash is empty for large files                    | File was unreadable; check the source path        |
-| Output dir missing                               | The script creates it; ensure parent is writable  |
+| Symptom                            | Fix                                                                                   |
+|------------------------------------|---------------------------------------------------------------------------------------|
+| BLAKE3 module not loaded; fallback | Install `b3sum.exe` or stay on SHA256                                                 |
+| Access denied on `C:\Windows\...`  | Add `-IncludeSystemPaths` (still read-only) or skip                                  |
+| Hash is empty for large files      | File was unreadable; check the source path                                            |
+| Output dir missing                 | The script creates it; ensure parent is writable                                      |
+| Log dir not appearing              | Check `-LogDir` and ensure parent is writable                                         |
+| ETA stays at `--`                  | First ~1 s after `hashing start`; speed history warmup                                |
+| Summary says `logWriteFailed=true` | Log file could not be written (locked / unwritable); JSON + CSV still produced        |

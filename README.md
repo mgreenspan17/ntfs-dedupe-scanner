@@ -15,9 +15,18 @@ dashboards plus a CSV mirror for spreadsheet review.
 - **Fast:** 2-5 minutes on a populated `C:\` (NVMe + 8+ threads)
 - **Safe:** P/Invoke to `GetFileInformationByHandle` opens files with
   `FILE_SHARE_READ|WRITE|DELETE` and zero write access
-- **Hashing:** BLAKE3 when `b3sum` is on PATH, SHA256 (BCL) otherwise
+- **Hashing:** BLAKE3 when `b3sum` is on PATH; SHA256 (BCL) per-file
+  fallback when `b3sum` exits non-zero, times out, or prints to stderr.
+  Records stamped with which algorithm was used; duplicate groups keep
+  BLAKE3 and SHA256 digests in separate buckets
 - **Hard-link aware:** Groups with a single NTFS File ID are flagged
   `hardlinked: true` and excluded from wasted-byte totals
+- **Live UX:** real-time ETA, per-folder progress bar (auto-collapse),
+  and live throughput display (instant + 5-s avg + peak MB/s) refreshed
+  every second (see [`docs/USAGE.md`](docs/USAGE.md#live-ux))
+- **Structured logs:** each session writes a timestamped
+  `[YYYY-MM-DD HH:MM:SS] LEVEL : message` log to `./logs/`
+  (see [`docs/LOGGING.md`](docs/LOGGING.md))
 - **Warp-dashboard JSON:** stable, versioned schema (see
   [`docs/OUTPUT_SCHEMA.md`](docs/OUTPUT_SCHEMA.md))
 - **CSV mirror:** one row per file for spreadsheet review
@@ -35,40 +44,76 @@ pwsh -File .\scripts\Invoke-NTFSDedupeScan.ps1 `
      -OutputDir .\output
 ```
 
-After completion you'll find two files in `.\output\`:
+After completion you'll find three artefacts:
 
-- `dedupe-<sessionId>.json` — Warp-dashboard-ready payload
-- `dedupe-<sessionId>.csv` — flat per-file rows
+- `.\\output\dedupe-<sessionId>.json` — Warp-dashboard-ready payload
+- `.\\output\dedupe-<sessionId>.csv` — flat per-file rows
+- `.\\logs\ntfs-dedupe-scan-<timestamp>.log` — structured run log
 
 ## Parameters
 
-| Parameter           | Default          | Notes                                          |
-|---------------------|------------------|------------------------------------------------|
-| `-Path`             | `C:\`            | Root path to scan                              |
-| `-OutputDir`        | `.\output`       | Where JSON + CSV are written                   |
-| `-HashAlgorithm`    | `SHA256`         | `SHA256` or `BLAKE3` (needs `b3sum` on PATH)   |
-| `-ThrottleLimit`    | `8`              | Max parallel hash workers                      |
-| `-IncludeSystemPaths` | off            | Include `System Volume Information` etc.       |
-| `-DryRun`           | off              | Enumerate and report counts without hashing    |
+| Parameter             | Default      | Notes                                          |
+|-----------------------|--------------|------------------------------------------------|
+| `-Path`               | `C:\`        | Root path to scan                              |
+| `-OutputDir`          | `.\output`   | Where JSON + CSV are written                   |
+| `-LogDir`             | `.\logs`     | Where the structured run log is written        |
+| `-HashAlgorithm`      | `SHA256`     | `SHA256` or `BLAKE3` (needs `b3sum` on PATH)   |
+| `-ThrottleLimit`      | `8`          | Reserved (per-file loop is sequential in 0.3.0)|
+| `-IncludeSystemPaths` | off          | Include `System Volume Information` etc.       |
+| `-DryRun`             | off          | Enumerate + total bytes; do not hash           |
+
+## Live UX (v0.3.0+)
+
+During a full scan the console + Write-Progress panel + log file all
+receive live updates every ~1 s:
+
+- ETA prediction rendered as `XXs`, `MM:SS`, or `HH:MM:SS`.
+- Per-folder progress bar:
+  `[\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588] 63% (45/71 files) C:\Users\Mannie\Project\Folder`
+  Commits to a single 100% line on completion (auto-collapse).
+- Throughput: `Speed: 87 MB/s (avg 82 MB/s, peak 104 MB/s)`.
+
+See [`docs/USAGE.md`](docs/USAGE.md#live-ux) and
+[`docs/LOGGING.md`](docs/LOGGING.md) for details.
 
 ## Outputs at a glance
 
 ```json
 {
-  "schemaVersion": "1.0.0",
-  "session": { "id": "...", "name": "dedupe-...", "author": "Mannie Greenspan <Oz agent>" },
+  "schemaVersion": "1.0.1",
+  "session": { "id": "...", "name": "dedupe-...", "author": "agent:oz|mannie-greenspan|<sessionId>" },
   "scannedAt": "2026-07-25T14:34:58Z",
+  "completedAt": "2026-07-25T14:39:11Z",
+  "durationSeconds": 253,
   "path": "C:\\",
-  "hashAlgorithm": "SHA256",
-  "scannedFiles": 482103,
+  "hashAlgorithm": "BLAKE3",
+  "hashAlgorithmFallback": null,
+  "blake3FallbackCount": 0,
+  "scannedFiles": 482101,
+  "attemptedFiles": 482103,
   "duplicateGroups": 3127,
+  "totalBytes": 4821038124,
   "totalWastedBytes": 18429384711,
+  "speedMBps": {
+    "instantaneous": 87.0,
+    "average5s": 82.4,
+    "peak": 104.1
+  },
+  "perFolder": [
+    { "path": "C:\\Users\\Mannie\\Photos", "files": 1234, "bytes": 5129381,
+      "durationSec": 12.4, "filesPerSec": 99.5 }
+  ],
   "topByWastedBytes": [ { ... }, ... ],
-  "groups": [ { "hash": "...", "fileCount": 4, "uniqueInodes": 2, "wastedBytes": 8294123, "hardlinked": false, "files": [ ... ] } ]
+  "groups": [ { "hash": "...", "fileCount": 4, "uniqueInodes": 2,
+                "wastedBytes": 8294123, "hardlinked": false, "files": [ ... ] } ]
 }
 ```
 
-See [`docs/OUTPUT_SCHEMA.md`](docs/OUTPUT_SCHEMA.md) for the full schema.
+The `schemaVersion` rolled from `1.0.0` to `1.0.1` in v0.4.0 to expose
+BLAKE3 -> SHA256 fallback observability; the new top-level fields are
+additive so older dashboards keep parsing the same fields. See
+[`docs/OUTPUT_SCHEMA.md`](docs/OUTPUT_SCHEMA.md) for the full schema and
+v1.0.0 -> v1.0.1 migration notes.
 
 ## Repository layout
 
@@ -78,9 +123,14 @@ ntfs-dedupe-scanner/
 │   └── Invoke-NTFSDedupeScan.ps1    # Main entry point
 ├── docs/
 │   ├── ARCHITECTURE.md
+│   ├── LOGGING.md
 │   ├── OUTPUT_SCHEMA.md
+│   ├── SECURITY.md
+│   ├── TRANSFER.md
+│   ├── FAQ.md
 │   └── USAGE.md
-├── output/                          # Generated reports land here
+├── output/                          # JSON + CSV artefacts
+├── logs/                            # Structured run logs (one per session)
 ├── sample-data/                     # Throwaway folder for fast tests
 ├── README.md
 ├── CHANGELOG.md
